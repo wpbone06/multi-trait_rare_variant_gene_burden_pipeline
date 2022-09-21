@@ -1,0 +1,10 @@
+#!/bin/bash
+
+#BSUB -J "GaMuT_pipeline"
+#BSUB -o GaMuT_pipeline.%J-%I.out
+#BSUB -e GaMuT_pipeline.%J-%I.err
+#BSUB -N
+
+#bsub to just fire off the GaMuT_pipeline_driver.sh code
+
+./GaMuT_pipeline_driver_v4.sh

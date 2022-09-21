@@ -1,0 +1,310 @@
+#!/bin/bash
+
+#BSUB -J "GaMuT_GENE_ID"
+#BSUB -o GaMuT_GENE_ID.%J-%I.out
+#BSUB -e GaMuT_GENE_ID.%J-%I.err
+
+#load needed modules
+module remove R
+module load R/3.6.3
+module load htslib
+module load bcftools/1.9
+module load plink/1.90Beta6.18
+module load eigensoft/6.0.1
+
+#NOTE: need to define gene, chromosome, and local_region_start and stop
+
+#NOTE: any ALL_CAPS variables are expected to be changed by the GaMuT_pipeline_driver.sh code before the bsub is submitted
+
+#source the pipeline config file
+source ANALYSIS_DIR/GaMuT_pipeline_config.sh
+
+##################################################################
+#Define run specfic variables
+##################################################################
+gene=GENE_ID
+gene_chr=GENE_CHR
+gene_start=`grep $gene $gene_bed | cut -f 2`
+gene_stop=`grep $gene $gene_bed | cut -f 3`
+
+##################################################################
+#collect the variants of interest in this gene
+##################################################################
+
+#generate the string to the pertinent input chromosome vcf file
+chr_vcf=$gene_vcf_input_path"$gene_chr"$gene_vcf_input_path_str_end
+
+#grab vcf header (head 1000 to make grep fast and if the header is longer than that it would be very unusual)
+zcat $chr_vcf | head -1000 | grep "^#" > GENE_DIR/$gene"_vcf_all_vars.vcf"
+
+#grab the variants from the input vcf file that are within the gene
+tabix $chr_vcf $gene_chr:$gene_start"-"$gene_stop >> GENE_DIR/$gene"_vcf_all_vars.vcf"
+
+#split multiallelic lines into bialleleic lines and rename variant IDs to be CHROM_POS_REF_ALT
+bcftools norm -m - -f $fasta_file -c w GENE_DIR/$gene"_vcf_all_vars.vcf" | bcftools annotate --set-id '%CHROM\_%POS\_%REF\_%ALT' -o GENE_DIR/$gene"_vcf_all_vars_biallele.vcf"
+
+#filter to grab only the variants that have their variant IDs in the Regenie.anno file (make's sure they are rare have an effect)
+
+#generate a list of the variants in the gene to analyze
+grep $gene $regenie_anno  | cut -f 1  > GENE_DIR/$gene"_analysis_var_IDs.txt"
+
+bcftools view --include ID==@GENE_DIR/$gene"_analysis_var_IDs.txt" GENE_DIR/$gene"_vcf_all_vars_biallele.vcf" -o GENE_DIR/$gene"_vars_biallele_VOI_only.vcf"
+
+#delete the all vars VCFs to save space
+rm GENE_DIR/$gene"_vcf_all_vars.vcf"
+rm GENE_DIR/$gene"_vcf_all_vars_biallele.vcf"
+
+
+##################################################################
+#remove related samples and samples that don't have complete phenotype data 
+##################################################################
+
+#remove related individuals from the vcf file
+bcftools view --samples-file $unrelated_sample_IDs GENE_DIR/$gene"_vars_biallele_VOI_only.vcf" -o GENE_DIR/$gene"_vars_biallele_VOI_only_unrelated.vcf"    
+
+#remove samples who do not have complete data for the traits of interest or pertinent covariates  
+bcftools view --samples-file ANALYSIS_DIR/complete_phenos_sample_IDs.txt --force-samples GENE_DIR/$gene"_vars_biallele_VOI_only_unrelated.vcf"  -o GENE_DIR/$gene"_vars_biallele_VOI_only_unrelated_complete_data.vcf"
+
+#remove samples who have a "half call" for any variant that is a variant of interest in this gene
+
+#make a list of samples that have missing GT calls that thus can't be converted accurately to minor allele counts
+bcftools query -i'GT="mis"' -f '[%SAMPLE\n]' GENE_DIR/$gene"_vars_biallele_VOI_only_unrelated_complete_data.vcf" > GENE_DIR/$gene"_bad_GT_samples.txt"
+ 
+#remove the samples that had bad GT calls from the input GT data
+bcftools view  --samples-file ^GENE_DIR/$gene"_bad_GT_samples.txt" GENE_DIR/$gene"_vars_biallele_VOI_only_unrelated_complete_data.vcf" -o GENE_DIR/$gene"_vars_biallele_VOI_only_unrelated_complete_data_no_bad_GT_samples.vcf"
+
+#remove variants that have no representative samples in them after filtration
+bcftools view --include 'INFO/AC>0' GENE_DIR/$gene"_vars_biallele_VOI_only_unrelated_complete_data_no_bad_GT_samples.vcf" -o GENE_DIR/$gene"_vars.vcf"
+
+#delete these intermediary files to save storage (can easily regenerate if we need to)
+rm GENE_DIR/$gene"_vars_biallele_VOI_only.vcf"
+rm GENE_DIR/$gene"_vars_biallele_VOI_only_unrelated.vcf" 
+rm GENE_DIR/$gene"_vars_biallele_VOI_only_unrelated_complete_data.vcf"
+rm GENE_DIR/$gene"_vars_biallele_VOI_only_unrelated_complete_data_no_bad_GT_samples.vcf"
+
+##################################################################
+#QC steps
+##################################################################
+
+#record number of variants and frequency of the variants
+bcftools stats GENE_DIR/$gene"_vars.vcf" > GENE_DIR/$gene"_vars.vcf.QC.stats"
+
+#NOTE: Consider if we need to  build a check of if and of the allele frequencies are over X (probably 1% throw an error)
+
+#count the total number of samples that are in this analysis
+
+#make a list of the sample IDs in this VCF file
+bcftools query --list-samples GENE_DIR/$gene"_vars.vcf" | tr " " "\n" > GENE_DIR/$gene"_vars.vcf.QC.samples"
+
+#make a list of the samples that carry 1 or more variants of any kind (count this file to know how many total carriers)
+bcftools query -i'GT="alt"' -f '[%SAMPLE ]\n' GENE_DIR/$gene"_vars.vcf" | tr " " "\n" | sort -u > GENE_DIR/$gene"_vars.vcf.QC.carriers"
+
+#make a file with the samples that are variant for each variant in the gene (also has all variant IDs for VOI in gene col 3)
+bcftools query -i'GT="alt"' -f '%CHROM  %POS %ID  [%SAMPLE ]\n' GENE_DIR/$gene"_vars.vcf" > GENE_DIR/$gene"_vars.vcf.QC.carriers.pervar"
+
+#calculate carrier frequency
+
+#count the number of carriers
+carrier_count=`wc -l GENE_DIR/$gene"_vars.vcf.QC.carriers" | tr " " "\t" | cut -f 1`
+
+#NOTE: need to test this
+#if there are 0 carriers then end the loop now
+if [ $( echo "$carrier_count == 0" | bc ) -eq 1 ]
+then
+
+    echo "The rare variants of interest carrier frequency for" $gene "is too low in this set of samples to perform an association test" >> $filtered_genes
+    echo "carrier frequency" 0  >> $filtered_genes
+    echo $gene "not enough variant carriers" $case_carrier_prop >> $filtered_genes
+    echo >> $filtered_genes
+    exit 0
+    #no longer a loop through genes so need to break here
+    #cd ANALYSIS_DIR
+    #continue
+
+fi
+
+ #count the number of samples in the file    sample_count=`wc -l GENE_DIR/$gene"_vars.vcf.QC.samples" | tr " " "\t" | cut -f 1`
+sample_count=`wc -l GENE_DIR/$gene"_vars.vcf.QC.samples" | tr " " "\t" | cut -f 1`
+
+#calculate carrier frequency
+carrier_prop=`echo "scale=7 ; $carrier_count / $sample_count" | bc`
+
+
+#continue to the next gene if there are not enough rare variant carriers in this gene
+if [ $( echo "$carrier_prop < $carrier_prop_min" | bc ) -eq 1 ]
+then
+
+    echo "The rare variants of interest carrier frequency for" $gene "is too low in this set of samples to perform an association test" >> $filtered_genes
+    echo "carrier frequency" $carrier_prop >> $filtered_genes
+    echo $gene "not enough variant carriers" $case_carrier_prop >> $filtered_genes
+    echo >> $filtered_genes
+    exit 0
+    #no longer a loop through genes so need to exit here
+    #cd ANALYSIS_DIR
+    #continue
+
+fi
+
+
+    #If a case-control trait is includeded in this analysis, then perform QC steps based on on that trait
+if [[ $case_control == "TRUE" ]]
+then
+
+        #Grab sample IDs of the ALL the cases from the phenotype file (The first column ofthe phenotype matrix should be the case-control field)
+        cat $pheno_mat | cut -f 1,2 | grep "1$" | cut -f 1 >  GENE_DIR/sample_IDs_cases.txt
+
+        #make a file that is the intersection of the cases and the carriers sample IDs
+        comm -12 sample_IDs_cases.txt GENE_DIR/$gene"_vars.vcf.QC.carriers" > GENE_DIR/$gene"_case_carriers"
+
+        #calculate the case-carrier frequency
+
+        #count the number of case-carriers
+        case_carrier_count=`wc -l GENE_DIR/$gene"_case_carriers" | tr " " "\t" | cut -f 1`
+
+        #calculate case-carrier frequency
+        case_carrier_prop=`echo "scale=7 ; $case_carrier_count / $sample_count" | bc`
+
+        #continue to the next gene if there are not enough case carriers in this gene
+    if [ $( echo "$case_carrier_prop < $case_carrier_prop_min" | bc ) -eq 1 ]
+    then
+
+        echo "The case-carrier frequency for" $gene "is too low in this set of samples to perform an association test" >> $filtered_genes
+        echo "case-carrier frequency" $case_carrier_prop >> $filtered_genes
+        echo $gene "not enough case-carriers" $case_carrier_prop >> $filtered_genes
+        echo >> $filtered_genes
+        exit 0
+        #no longer a loop through genes so need to break here
+        #cd ANALYSIS_DIR
+        #continue
+
+    fi
+
+
+fi
+
+
+##################################################################
+#Prep input files for actually running GaMuT
+##################################################################
+
+##################################################################
+#Prep the Genotype matrix
+##################################################################
+
+#NOTE: Left this without a --vcf-half-call flag, because there should not be any half calls in the data at this point. If there are I want it to throw an error
+#reformat GTs to allele count format
+plink --vcf GENE_DIR/$gene"_vars.vcf" --recodeA --out GENE_DIR/$gene"_vars_recodeA"
+
+#generate a GaMuT ready file from the $gene"_vars_recodeA.raw" file output by plink (sample ID and variant cols only)
+cut --complement -d " " -f 1,3,4,5,6 GENE_DIR/$gene"_vars_recodeA.raw"  | tr " " "\t" > GENE_DIR/$gene"_vars_GT_mat.txt"
+
+##################################################################
+#run PCA on local variants to include in covariates
+##################################################################
+
+#define the region to collect the variants for the PCA from the array data
+local_region_start="$(($gene_start-$local_window))"
+local_region_stop="$(($gene_stop+$local_window))"
+
+#make the variable for the input array data vcf file name
+array_chr_vcf=$array_vcf_input_path
+#might not get the imputed data tbi file so deprecated this for now
+#array_chr_vcf=$array_vcf_input_path"$gene_chr"$array_vcf_input_path_str_end
+
+
+#grab vcf header (head 1000 to make grep fast and if the header is longer than that it would be very unusual)
+zcat $array_chr_vcf | head -1000 | grep "^#" > GENE_DIR/$gene"_local_array_variants.vcf"
+
+#tabix command to grab local variants from array VCF
+tabix $array_chr_vcf $gene_chr:$local_region_start"-"$local_region_stop >> GENE_DIR/$gene"_local_array_variants.vcf"
+
+#NOTE: convert VCF to plink format
+plink --vcf GENE_DIR/$gene"_local_array_variants.vcf" --recode --out GENE_DIR/$gene"_local_array_variants"
+
+#use convertf (part of eigensoft) to convert the $gene"_local_array_variants" plink files to eigensoft format
+
+#make convertf parameter file
+echo -e "genotypename:\t"$gene"_local_array_variants.ped" > GENE_DIR/par.PED.EIGENSTRAT
+echo -e "snpname:\t"$gene"_local_array_variants.map" >> GENE_DIR/par.PED.EIGENSTRAT
+echo -e "indivname:\t"$gene"_local_array_variants.ped" >> GENE_DIR/par.PED.EIGENSTRAT
+echo -e "outputformat:\tEIGENSTRAT" >> GENE_DIR/par.PED.EIGENSTRAT
+echo -e "genotypeoutname:\t"$gene"_local_array_variants.geno" >> GENE_DIR/par.PED.EIGENSTRAT
+echo -e "snpoutname:\t"$gene"_local_array_variants.snp" >> GENE_DIR/par.PED.EIGENSTRAT
+echo -e "indivoutname:\t"$gene"_local_array_variants.ind" >> GENE_DIR/par.PED.EIGENSTRAT
+echo -e "familynames:\tNO" >> GENE_DIR/par.PED.EIGENSTRAT
+
+#run convertf
+convertf -p GENE_DIR/par.PED.EIGENSTRAT
+
+#make the smartpca parameter file
+echo -e "genotypename:\t"$gene"_local_array_variants.geno" > GENE_DIR/GENE_ID_local_array_variants_smartpca.par
+echo -e "snpname:\t"$gene"_local_array_variants.snp" >> GENE_DIR/GENE_ID_local_array_variants_smartpca.par
+echo -e "indivname:\t"$gene"_local_array_variants.ind" >> GENE_DIR/GENE_ID_local_array_variants_smartpca.par
+echo -e "evecoutname:\t"$gene"_local_array_variants.evec" >> GENE_DIR/GENE_ID_local_array_variants_smartpca.par
+echo -e "evaloutname:\t"$gene"_local_array_variants.eval" >> GENE_DIR/GENE_ID_local_array_variants_smartpca.par
+echo -e "numoutevec:\t10" >> GENE_DIR/GENE_ID_local_array_variants_smartpca.par
+echo -e "fastmode:\tYES" >> GENE_DIR/GENE_ID_local_array_variants_smartpca.par
+
+#run smartpca
+smartpca -p GENE_DIR/GENE_ID_local_array_variants_smartpca.par
+
+#delete the big intermediate local array files to save storage
+rm GENE_DIR/$gene"_local_array_variants.geno"
+rm GENE_DIR/$gene"_local_array_variants.ped"
+rm GENE_DIR/$gene"_local_array_variants.vcf"
+rm GENE_DIR/$gene"_local_array_variants.ind"
+rm GENE_DIR/$gene"_local_array_variants.nosex"
+
+
+
+#Clean up the eigen vector output from smartpca 
+#NOTE: will need to assess what the number of PCs should be!
+
+#add a header to the clean file
+echo -e "PMBB_ID\tPC1\tPC2\tPC3\tPC4\tPC5\tPC6\tPC7\tPC8\tPC9\tPC10" > GENE_DIR/$gene"_local_vars_PCs_clean.evec"
+
+#fix formatting of evec files have many spaces instead of tabs between fields need to fix this with sed, need to remove "case control" field in last column (revs and cut commands), need to remove the eigenvalues first row tail command, finally there is an extra tab at the beginning of the output removed by the last sed command
+tail -n +2 GENE_DIR/$gene"_local_array_variants.evec" | sed 's/ \+/\t/g' | rev | cut --complement -f 1 | rev | sed 's/^\t//' >> GENE_DIR/$gene"_local_vars_PCs_clean.evec"
+
+#cut -d " " -f 2-8 GENE_DIR/$gene"_local_vars_PCs.eigenvec" | tr " " "\t" >> GENE_DIR/$gene"_local_vars_PCs_clean.eigenvec"
+
+#save the eigen vectors file as a variable for later
+local_vars_PCs=GENE_DIR/$gene"_local_vars_PCs_clean.evec"
+
+
+##################################################################
+#Prep Phenotype matrix
+##################################################################
+
+#put the header of the pheno_mat in the input file
+head -1 $pheno_mat > GENE_DIR/$gene"_pheno_mat.txt"
+
+#subset the pheno_mat to just the samples in this analysis (sorts are just to handle headers)
+join <(sort -k 1 $pheno_mat)  <(sort -k 1 GENE_DIR/$gene"_vars.vcf.QC.samples") | tr " " "\t" >> GENE_DIR/$gene"_pheno_mat.txt"
+
+
+##################################################################
+#Prep Covar matrix
+##################################################################
+
+#make a covariates file that only has the samples from this analysis
+
+#add the header to the output file
+head -1 $covar_mat > GENE_DIR/$gene"_covar_mat.txt"
+
+#subset the covar_mat to just the samples in this analysis (sorts are just to handle headers)
+join <(sort -k 1 $covar_mat) <(sort -k 1 GENE_DIR/$gene"_vars.vcf.QC.samples") | tr " " "\t" >> GENE_DIR/$gene"_covar_mat.txt"
+
+#use Rscript to merge all covariate files into one file for input into GaMuT (First 4 inputs are covariate files and hte last input is the name of the output covariate matrix file that goes into the GaMuT job)
+
+Rscript $merge_Covars GENE_DIR/$gene"_covar_mat.txt" $common_vars_PCs $rare_vars_PCs $local_vars_PCs GENE_DIR/$gene"_all_covar_mat.txt"
+
+
+##################################################################
+#Run GaMuT
+##################################################################
+
+Rscript GAMUT_RSCRIPT GENE_DIR/GaMuT_config.R
+
+#compress the gene vcf file
+gzip GENE_DIR/$gene"_vars.vcf"
